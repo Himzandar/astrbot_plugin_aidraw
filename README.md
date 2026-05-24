@@ -16,6 +16,7 @@
 
 ### LLM工具调用优化
 - **进度显示开关**：新增 `llm_show_progress` 配置项，可控制LLM工具调用时是否发送"正在生成..."等进度提示，关闭后直接发送结果图片
+- **二次收尾开关**：新增 `llm_suppress_tool_followup` 配置项，默认关闭生图工具成功后的第二次LLM收尾回复，避免等待话抢在图片前发送
 - **用户独立冷却时间**：新增 `llm_cooldown_seconds` 配置项（默认60秒），每个用户独立计时，防止单用户无节制刷图，不影响其他用户正常使用
 
 ### 文生图专用模型
@@ -161,6 +162,7 @@
 | --- | --- | --- |
 | `text_to_image_model` | 文生图专用模型ID，留空使用默认模型 | 空 |
 | `llm_show_progress` | LLM工具调用时是否显示进度提示 | true |
+| `llm_suppress_tool_followup` | 关闭生图工具成功后的二次LLM收尾回复，避免等待/收尾话抢在图片前发送 | true |
 | `llm_cooldown_seconds` | LLM工具调用冷却时间（秒），设为0不限制 | 60 |
 | `enable_rebellious_mode` | 启用叛逆模式 | true |
 | `rebellious_probability` | 叛逆模式随机触发概率（0-1） | 0.3 |

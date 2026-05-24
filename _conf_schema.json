@@ -324,6 +324,12 @@
       "hint": "LLM工具调用时是否发送生成状态提示（如'正在生成...'），关闭后直接发送结果图片",
       "default": true
     },
+    "llm_suppress_tool_followup": {
+      "description": "【LLM】关闭工具收尾回复",
+      "type": "bool",
+      "hint": "开启后，生图工具成功启动或已发送结果时不再把工具成功结果交给第二次LLM回复，避免收尾/等待话抢在图片前发送。",
+      "default": true
+    },
     "llm_cooldown_seconds": {
       "description": "【LLM】工具调用冷却时间(秒)",
       "type": "int",

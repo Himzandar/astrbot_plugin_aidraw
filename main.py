@@ -119,6 +119,19 @@ class FigurineProPlugin(Star):
         "power_gemini_api_url",
         "power_gemini_api_keys",
     ]
+    _DYNAMIC_CONFIG_KEYS = [
+        "model",
+        "text_to_image_model",
+        "text_to_image_api_url",
+        "text_to_image_api_keys",
+        "api_mode",
+        "prompt_list",
+        "generic_api_url",
+        "generic_api_keys",
+        "gemini_api_url",
+        "gemini_api_keys",
+    ]
+    _DYNAMIC_CONFIG_META_KEY = "__dynamic_overrides__"
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -557,8 +570,8 @@ class FigurineProPlugin(Star):
         if removed_from_runtime > 0:
             logger.info(f"FigurinePro: 已从运行时配置中清理 {removed_from_runtime} 个废弃强力模式字段")
 
-        # 尝试加载动态配置备份
-        # 注意：仅在当前配置缺失/为空时才回退恢复，避免覆盖用户手动写入的 JSON 配置
+        # 尝试加载动态配置备份。通过命令改动过的字段需要覆盖 schema 默认值，
+        # 否则重启后会被默认配置重新盖回去。
         import os
         import json
         config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
@@ -567,32 +580,38 @@ class FigurineProPlugin(Star):
                 with open(config_path, "r", encoding="utf-8") as f:
                     dynamic_conf = json.load(f)
 
-                if isinstance(dynamic_conf, dict):
-                    removed_from_backup = self._purge_deprecated_config_keys(dynamic_conf)
-                    if removed_from_backup > 0:
-                        with open(config_path, "w", encoding="utf-8") as fw:
-                            json.dump(dynamic_conf, fw, ensure_ascii=False, indent=2)
-                        logger.info(
-                            f"FigurinePro: 已从 dynamic_config.json 清理 {removed_from_backup} 个废弃强力模式字段")
+                if not isinstance(dynamic_conf, dict):
+                    dynamic_conf = {}
+
+                removed_from_backup = self._purge_deprecated_config_keys(dynamic_conf)
+                if removed_from_backup > 0:
+                    with open(config_path, "w", encoding="utf-8") as fw:
+                        json.dump(dynamic_conf, fw, ensure_ascii=False, indent=2)
+                    logger.info(
+                        f"FigurinePro: 已从 dynamic_config.json 清理 {removed_from_backup} 个废弃强力模式字段")
 
                 restored_count = 0
                 skipped_count = 0
+                dynamic_keys = set(self._DYNAMIC_CONFIG_KEYS)
+                override_keys = dynamic_conf.get(self._DYNAMIC_CONFIG_META_KEY)
+                has_override_meta = isinstance(override_keys, list)
+                if has_override_meta:
+                    keys_to_restore = [k for k in override_keys if k in dynamic_keys]
+                else:
+                    # 兼容旧版 dynamic_config.json：没有元数据时，按所有已知动态字段恢复。
+                    keys_to_restore = [k for k in dynamic_conf.keys() if k in dynamic_keys]
 
-                for k, v in dynamic_conf.items():
-                    # 仅在当前配置完全缺失时才从 dynamic_config.json 回填。
-                    # 如果用户把主 JSON 配置项清空，空值本身也是一次明确配置，不能再被旧备份覆盖。
-                    if v is None or v == "" or v == [] or v == {}:
+                for k in keys_to_restore:
+                    v = dynamic_conf.get(k)
+                    if v is None or (not has_override_meta and (v == "" or v == [] or v == {})):
                         skipped_count += 1
                         continue
 
-                    if k not in self.conf:
-                        self.conf[k] = v
-                        restored_count += 1
-                    else:
-                        skipped_count += 1
+                    self.conf[k] = v
+                    restored_count += 1
 
                 logger.info(
-                    f"FigurinePro: dynamic_config.json 恢复完成，恢复 {restored_count} 项，跳过 {skipped_count} 项（已有主配置值时不覆盖）"
+                    f"FigurinePro: dynamic_config.json 恢复完成，恢复 {restored_count} 项，跳过 {skipped_count} 项"
                 )
             except Exception as e:
                 logger.error(f"FigurinePro: 恢复动态配置失败 {e}")
@@ -643,44 +662,56 @@ class FigurineProPlugin(Star):
         logger.debug(f"FigurinePro: Bot ID resolved as: {bot_id}")
         return bot_id or ""
 
-    def _save_config(self):
+    def _save_config(self, changed_keys: Optional[List[str]] = None):
         try:
             self._purge_deprecated_config_keys()
 
             # 尝试 AstrBot 原生配置保存
             saved = False
-            if hasattr(self.conf, "save") and callable(self.conf.save):
-                self.conf.save()
-                saved = True
-            elif hasattr(self.context, "save_config"):
-                self.context.save_config(self.conf)
-                saved = True
+            try:
+                if hasattr(self.conf, "save") and callable(self.conf.save):
+                    self.conf.save()
+                    saved = True
+                elif hasattr(self.context, "save_config"):
+                    self.context.save_config(self.conf)
+                    saved = True
+            except Exception as e:
+                logger.warning(f"FigurinePro: AstrBot 原生配置保存失败，将继续写入动态备份: {e}")
 
             # 无论原生是否成功，都在插件目录做一份备份以防万一
             import os
             import json
             config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
 
-            # 要备份的动态配置字段
-            # 这些字段可能通过指令或运行时被修改，需要持久化；
-            # 同时避免仅靠旧备份覆盖用户手动写入的主配置。
-            dynamic_keys = [
-                "model",
-                "text_to_image_model",
-                "text_to_image_api_url",
-                "text_to_image_api_keys",
-                "api_mode",
-                "prompt_list",
-                "generic_api_url",
-                "generic_api_keys",
-                "gemini_api_url",
-                "gemini_api_keys"
-            ]
+            dynamic_keys = list(self._DYNAMIC_CONFIG_KEYS)
+            previous_overrides = set()
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, "r", encoding="utf-8") as rf:
+                        previous_data = json.load(rf)
+                    if isinstance(previous_data, dict):
+                        previous_raw = previous_data.get(self._DYNAMIC_CONFIG_META_KEY, [])
+                        if isinstance(previous_raw, list):
+                            previous_overrides = {k for k in previous_raw if k in dynamic_keys}
+                        else:
+                            previous_overrides = {
+                                k for k in previous_data.keys()
+                                if k in dynamic_keys and previous_data.get(k) not in (None, "", [], {})
+                            }
+                except Exception:
+                    previous_overrides = set()
+
+            if changed_keys:
+                current_overrides = {k for k in changed_keys if k in dynamic_keys}
+                override_keys = sorted(previous_overrides | current_overrides)
+            else:
+                override_keys = sorted(previous_overrides or dynamic_keys)
 
             save_data = {}
             for k in dynamic_keys:
                 if k in self.conf:
                     save_data[k] = self.conf[k]
+            save_data[self._DYNAMIC_CONFIG_META_KEY] = override_keys
 
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(save_data, f, ensure_ascii=False, indent=2)
@@ -1601,6 +1632,14 @@ class FigurineProPlugin(Star):
 
         return result
 
+    def _finalize_llm_tool_success(self, text: str = "") -> Optional[str]:
+        """成功结果默认不再交给二次 LLM，避免收尾话抢在图片前发出。"""
+        if self._get_conf_bool("llm_suppress_tool_followup", True):
+            return None
+        return self._finalize_llm_tool_result(
+            text or "[TOOL_SUCCESS] 任务已完成，结果已发送给用户。"
+        )
+
     async def _prepare_send_image_bytes(self, image_bytes: bytes) -> bytes:
         """发送前保持原图，避免任何有损压缩或缩放。"""
         return image_bytes
@@ -2329,7 +2368,7 @@ class FigurineProPlugin(Star):
         # 4.1 新任务开始前，若当前会话空闲则清掉上一轮生成缓存，避免后续 PDF 混入旧图
         await self._clear_session_image_cache_if_idle(event.unified_msg_origin)
 
-        # 5. 启动后台生成任务（不阻塞，让 LLM 能立即输出等待/陪伴语句）
+        # 5. 启动后台生成任务。成功结果默认静默收口，避免触发二次 LLM 抢话。
         await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
             asyncio.create_task(self._run_background_task(
@@ -2344,7 +2383,7 @@ class FigurineProPlugin(Star):
                 hide_llm_result_text, suppress_user_error=True
             ))
 
-        # 6. 立即返回给 LLM
+        # 6. 根据配置决定是否交给二次 LLM 收尾；默认直接结束工具循环。
         vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid,
                                                                                                            event) else ""
         rebellious_hint = vip_hint or self._get_rebellious_hint(prompt, uid, event)
@@ -2356,15 +2395,15 @@ class FigurineProPlugin(Star):
             if count_limit_reply:
                 _draw_hint += " " + count_limit_reply
             _draw_hint += rebellious_hint
-            return _draw_hint
+            return self._finalize_llm_tool_success(_draw_hint)
         else:
             if count_limit_reply:
-                return self._finalize_llm_tool_result(
+                return self._finalize_llm_tool_success(
                     f"[TOOL_SUCCESS] 正在画图中。{count_limit_reply} 请用自然语气回复一句等待的话。")
             if count > 1:
-                return self._finalize_llm_tool_result(
+                return self._finalize_llm_tool_success(
                     f"[TOOL_SUCCESS] 正在画{count}张图。请自然地回复一句让用户稍等的话，不要用'生成'等机械词汇。")
-            return self._finalize_llm_tool_result(
+            return self._finalize_llm_tool_success(
                 "[TOOL_SUCCESS] 画图任务已启动，请随口说一句让用户稍等的话，比如'等我一下哦'。")
 
     @filter.llm_tool(name="shoubanhua_edit_image")
@@ -2575,12 +2614,12 @@ class FigurineProPlugin(Star):
                 _multi_hint = "[TOOL_SUCCESS] 这批图处理完发出去了。"
                 if total_fail > 0:
                     _multi_hint = f"[TOOL_SUCCESS] 发出去了{total_success}张，有{total_fail}张没弄好。"
-                return _multi_hint + rebellious_hint
+                return self._finalize_llm_tool_success(_multi_hint + rebellious_hint)
             else:
                 if total_fail > 0:
-                    return self._finalize_llm_tool_result(
+                    return self._finalize_llm_tool_success(
                         f"[TOOL_SUCCESS] 发出去了{total_success}张，有{total_fail}张没弄好。用你自己的语气随口带过。")
-                return self._finalize_llm_tool_result(
+                return self._finalize_llm_tool_success(
                     f"[TOOL_SUCCESS] {total_images}张图都弄好发出去了。用你自己的语气随口带过，也可以什么都不说。")
 
         # ==== 分支：普通单次处理（单图或合并多图） ====
@@ -2606,7 +2645,7 @@ class FigurineProPlugin(Star):
         # 6.1 新任务开始前，若当前会话空闲则清掉上一轮生成缓存，避免后续 PDF 混入旧图
         await self._clear_session_image_cache_if_idle(event.unified_msg_origin)
 
-        # 7. 启动后台生成任务（不阻塞，让 LLM 能立即输出等待/陪伴语句）
+        # 7. 启动后台生成任务。成功结果默认静默收口，避免触发二次 LLM 抢话。
         await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
             asyncio.create_task(self._run_background_task(
@@ -2619,7 +2658,7 @@ class FigurineProPlugin(Star):
                 extra_rules, hide_llm_result_text, suppress_user_error=True
             ))
 
-        # 返回结果 - 在图片生成任务启动后立刻告诉 LLM 任务开始了
+        # 根据配置决定是否交给二次 LLM 收尾；默认直接结束工具循环。
         # 对主人/VIP优先注入更柔和的亲近提示，普通用户保留原有叛逆逻辑
         vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid,
                                                                                                            event) else ""
@@ -2632,15 +2671,15 @@ class FigurineProPlugin(Star):
             if count_limit_reply:
                 _edit_hint += " " + count_limit_reply
             _edit_hint += rebellious_hint
-            return _edit_hint
+            return self._finalize_llm_tool_success(_edit_hint)
         else:
             if count_limit_reply:
-                return self._finalize_llm_tool_result(
+                return self._finalize_llm_tool_success(
                     f"[TOOL_SUCCESS] 图正在处理。{count_limit_reply} 请自然地回复一句等待的话。")
             if count > 1:
-                return self._finalize_llm_tool_result(
+                return self._finalize_llm_tool_success(
                     f"[TOOL_SUCCESS] 正在制作{count}个版本。用你自己的语气自然地告诉用户稍等一下。")
-            return self._finalize_llm_tool_result(
+            return self._finalize_llm_tool_success(
                 "[TOOL_SUCCESS] 图片处理任务已启动。用你自己的语气随口说一句让用户等一下的话。")
 
     # ================= 传统指令触发 =================
@@ -2871,7 +2910,7 @@ class FigurineProPlugin(Star):
         # 添加新预设
         prompt_list.append(f"{k}:{v}")
         self.conf["prompt_list"] = prompt_list
-        self._save_config()
+        self._save_config(["prompt_list"])
 
         yield event.chain_result([Plain(f"✅ 已添加预设: {k}\n💾 已同步保存到配置文件")])
 
@@ -2924,7 +2963,7 @@ class FigurineProPlugin(Star):
         ref_count = await self.data_mgr.clear_preset_ref_images(name)
 
         self.data_mgr.reload_prompts()
-        self._save_config()
+        self._save_config(["prompt_list"])
 
         details = []
         if removed_runtime:
@@ -2982,7 +3021,7 @@ class FigurineProPlugin(Star):
         mode = event.message_str.split()[-1]
         if mode in ["generic", "gemini_official"]:
             self.conf["api_mode"] = mode;
-            self._save_config()
+            self._save_config(["api_mode"])
             yield event.chain_result([Plain(f"✅ 已切换为 {mode}")])
         else:
             yield event.chain_result([Plain("模式无效 (generic / gemini_official)")])
@@ -3007,14 +3046,14 @@ class FigurineProPlugin(Star):
             idx = int(target) - 1
             if 0 <= idx < len(all_m):
                 self.conf["model"] = all_m[idx]
-                self._save_config()
+                self._save_config(["model"])
                 yield event.chain_result([Plain(f"✅ 已切换为预设模型: {all_m[idx]}")])
             else:
                 yield event.chain_result([Plain("序号超出范围了")])
         else:
             # 直接按名称写入任意模型
             self.conf["model"] = target
-            self._save_config()
+            self._save_config(["model"])
             yield event.chain_result([Plain(f"✅ 已直接切换为自定义模型: {target}")])
 
     @filter.command("手办化今日统计", prefix_optional=True)
@@ -3119,7 +3158,7 @@ class FigurineProPlugin(Star):
         curr_keys = self.conf.get(field, [])
         curr_keys.extend(keys)
         self.conf[field] = curr_keys;
-        self._save_config()
+        self._save_config([field])
         yield event.chain_result([Plain(f"✅ 已向 {field} 添加 {len(keys)} 个 Key")])
 
     @filter.command("手办化key列表", prefix_optional=True)
@@ -3146,7 +3185,7 @@ class FigurineProPlugin(Star):
 
         if idx_str == "all":
             self.conf[field] = [];
-            self._save_config()
+            self._save_config([field])
             yield event.chain_result([Plain("✅ 已清空")])
         elif idx_str.isdigit():
             keys = self.conf.get(field, [])
@@ -3154,7 +3193,7 @@ class FigurineProPlugin(Star):
             if 0 <= idx < len(keys):
                 keys.pop(idx);
                 self.conf[field] = keys;
-                self._save_config()
+                self._save_config([field])
                 yield event.chain_result([Plain("✅ 已删除")])
 
     @filter.command("预设图片清理", prefix_optional=True)
@@ -3354,7 +3393,7 @@ class FigurineProPlugin(Star):
             if not success:
                 return self._build_llm_tool_failure(error_msg)
 
-            return self._finalize_llm_tool_result(
+            return self._finalize_llm_tool_success(
                 f"[TOOL_SUCCESS] 文生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
         elif task_type == "image_to_image":
@@ -3408,7 +3447,7 @@ class FigurineProPlugin(Star):
             if not success:
                 return self._build_llm_tool_failure(error_msg)
 
-            return self._finalize_llm_tool_result(
+            return self._finalize_llm_tool_success(
                 f"[TOOL_SUCCESS] 图生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
         return "未知任务类型"
@@ -4254,7 +4293,7 @@ class FigurineProPlugin(Star):
             if success:
                 # 打包成功后清除本次会话的图片缓存，防止旧图污染下次打包
                 await self._clear_session_image_cache(session_id)
-                return self._finalize_llm_tool_result(
+                return self._finalize_llm_tool_success(
                     "[TOOL_SUCCESS] 图片已经打包成 PDF 并发送给用户。"
                     "你可以按原本人设自然接话，也可以不补充收尾。"
                 )
@@ -4572,7 +4611,7 @@ class FigurineProPlugin(Star):
 
         asyncio.create_task(wrapped_process_all())
 
-        return self._finalize_llm_tool_result(
+        return self._finalize_llm_tool_success(
             f"[TOOL_SUCCESS] 批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。")
 
     @filter.llm_tool(name="shoubanhua_batch_process_concurrent")
@@ -4879,13 +4918,13 @@ class FigurineProPlugin(Star):
         asyncio.create_task(wrapped_process_all())
 
         if output_as_pdf:
-            return self._finalize_llm_tool_result(
+            return self._finalize_llm_tool_success(
                 f"[TOOL_SUCCESS] 并发批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。"
                 "这次不会一张张发出，我会等整批都完成后直接整理成一个 PDF 发给用户。"
                 "请用自然语言告诉用户稍等即可，不要用'生成'等机械词汇。"
             )
 
-        return self._finalize_llm_tool_result(
+        return self._finalize_llm_tool_success(
             f"[TOOL_SUCCESS] 并发批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。"
             "图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。"
         )
@@ -5095,7 +5134,7 @@ class FigurineProPlugin(Star):
         # 9. 计算是否隐藏输出文本（白名单用户和普通用户使用同一开关）
         hide_llm_result_text = True
 
-        # 10. 启动后台生成任务（非阻塞，让 LLM 能够先输出“我换个姿势拍一张”的互动文案）
+        # 10. 启动后台生成任务。成功结果默认静默收口，避免触发二次 LLM 抢话。
         await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
             asyncio.create_task(self._run_background_task(
@@ -5112,9 +5151,9 @@ class FigurineProPlugin(Star):
                 suppress_user_error=True
             ))
             if count_limited:
-                return self._finalize_llm_tool_result(
+                return self._finalize_llm_tool_success(
                     f"[TOOL_SUCCESS] 拍照任务已开始。{self._build_count_limit_reply(count, 'persona')} 请自然回复。")
-            return self._finalize_llm_tool_result(
+            return self._finalize_llm_tool_success(
                 f"[TOOL_SUCCESS] 正在准备发照片给用户。请用你自己的语气自然地说一句陪伴等待的话（比如“那我换个姿势给你拍一张哦...”），不要提'生成'等机械词汇。")
         else:
             # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
@@ -5135,9 +5174,9 @@ class FigurineProPlugin(Star):
                 suppress_user_error=True
             ))
             if count_limited:
-                return self._finalize_llm_tool_result(
+                return self._finalize_llm_tool_success(
                     f"[TOOL_SUCCESS] 多张拍照任务已开始。{self._build_count_limit_reply(count, 'persona')} 请自然回复。")
-            return self._finalize_llm_tool_result(
+            return self._finalize_llm_tool_success(
                 f"[TOOL_SUCCESS] 正在准备拍{count}张照片给用户。请用你自己的语气自然地说一句等待的话（比如“那我多换几个角度拍给你看哦...”），不要提'生成'等机械词汇。")
 
     @filter.command("人设拍照", prefix_optional=True)
