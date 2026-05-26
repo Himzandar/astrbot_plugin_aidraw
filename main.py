@@ -1,22 +1,24 @@
-﻿import re
-import asyncio
+﻿import asyncio
 import json
+import re
 from datetime import datetime
-from typing import Optional, List, Tuple, Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 from astrbot import logger
 from astrbot.api.event import filter
-from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import Image, Plain, Node, Nodes, At, Reply
+from astrbot.core.message.components import At, Image, Node, Nodes, Plain, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
+
+from .api_manager import ApiManager
+from .context_manager import ContextManager, LLMTaskAnalyzer
 
 # 导入模块
 from .data_manager import DataManager
+from .generation_cache import LocalGenerationCache
 from .image_manager import ImageManager
-from .api_manager import ApiManager
-from .context_manager import ContextManager, LLMTaskAnalyzer
-from .utils import norm_id, extract_image_urls_from_text
+from .utils import extract_image_urls_from_text, norm_id
 
 # 内置叛逆词库 - 用于LLM判断时增加个性化回复
 # 注意：避免使用"画"字，因为人设拍照等场景不适合
@@ -130,6 +132,8 @@ class FigurineProPlugin(Star):
         "generic_api_keys",
         "gemini_api_url",
         "gemini_api_keys",
+        "enable_local_generation_cache",
+        "local_generation_prompt_history_limit",
     ]
     _DYNAMIC_CONFIG_META_KEY = "__dynamic_overrides__"
 
@@ -139,6 +143,7 @@ class FigurineProPlugin(Star):
 
         self.data_mgr = DataManager(StarTools.get_data_dir(), config)
         self.img_mgr = ImageManager(config)
+        self.generation_cache = LocalGenerationCache(StarTools.get_data_dir(), config)
         self.api_mgr = ApiManager(config)
 
         # 上下文管理器
@@ -565,6 +570,66 @@ class FigurineProPlugin(Star):
             return []
         return await self.data_mgr.load_preset_ref_images_bytes("_persona_")
 
+    async def _record_local_generation_result(
+            self,
+            *,
+            prompt: str,
+            result: bytes | str,
+            attempts: list[dict] | None = None,
+            context: dict | None = None,
+    ) -> None:
+        await self.generation_cache.record_generation(
+            prompt=prompt,
+            result=result,
+            attempts=attempts,
+            context=context,
+        )
+
+    async def _call_api_with_local_cache(
+            self,
+            images: List[bytes],
+            prompt: str,
+            model: str,
+            legacy_use_power_or_proxy=None,
+            proxy: str = None,
+            use_text_to_image_api: bool = False,
+    ) -> bytes | str:
+        result = await self.api_mgr.call_api(
+            images,
+            prompt,
+            model,
+            legacy_use_power_or_proxy,
+            proxy,
+            use_text_to_image_api=use_text_to_image_api,
+        )
+
+        api_mode = str(self.conf.get("api_mode", "generic") or "generic").strip()
+        if use_text_to_image_api:
+            if api_mode == "gemini_official":
+                api_url = self.conf.get("text_to_image_api_url") or self.conf.get("gemini_api_url")
+            else:
+                api_url = self.conf.get("text_to_image_api_url") or self.conf.get("generic_api_url")
+        else:
+            if api_mode == "gemini_official":
+                api_url = self.conf.get("gemini_api_url")
+            else:
+                api_url = self.conf.get("generic_api_url")
+
+        await self._record_local_generation_result(
+            prompt=prompt,
+            result=result,
+            attempts=None,
+            context={
+                "model": str(model or "").strip(),
+                "api_mode": api_mode,
+                "api_url": str(api_url or "").strip(),
+                "use_text_to_image_api": bool(use_text_to_image_api),
+                "image_count": len(images or []),
+                "request_kind": "image_to_image" if images else "text_to_image",
+            },
+        )
+        return result
+
     async def initialize(self):
         removed_from_runtime = self._purge_deprecated_config_keys()
         if removed_from_runtime > 0:
@@ -572,8 +637,8 @@ class FigurineProPlugin(Star):
 
         # 尝试加载动态配置备份。通过命令改动过的字段需要覆盖 schema 默认值，
         # 否则重启后会被默认配置重新盖回去。
-        import os
         import json
+        import os
         config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
         if os.path.exists(config_path):
             try:
@@ -679,8 +744,8 @@ class FigurineProPlugin(Star):
                 logger.warning(f"FigurinePro: AstrBot 原生配置保存失败，将继续写入动态备份: {e}")
 
             # 无论原生是否成功，都在插件目录做一份备份以防万一
-            import os
             import json
+            import os
             config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
 
             dynamic_keys = list(self._DYNAMIC_CONFIG_KEYS)
@@ -727,7 +792,8 @@ class FigurineProPlugin(Star):
         if not prompt:
             return prompt
 
-        if not self.conf.get("enable_preset_safety_suffix", True):
+        # 默认不追加
+        if not self.conf.get("enable_preset_safety_suffix", False):
             return prompt
 
         suffix = self.conf.get(
@@ -1864,7 +1930,7 @@ class FigurineProPlugin(Star):
 
             res = None
             for attempt in range(2):
-                res = await self.api_mgr.call_api(
+                res = await self._call_api_with_local_cache(
                     images, prompt, model, False, self.img_mgr.proxy,
                     use_text_to_image_api=use_text_to_image_api
                 )
@@ -1983,7 +2049,7 @@ class FigurineProPlugin(Star):
 
                         while retry_count <= max_retries:
                             start_time = datetime.now()
-                            res = await self.api_mgr.call_api(
+                            res = await self._call_api_with_local_cache(
                                 images, prompt, model, False, self.img_mgr.proxy,
                                 use_text_to_image_api=True
                             )
@@ -2126,7 +2192,7 @@ class FigurineProPlugin(Star):
 
                         while retry_count <= max_retries:
                             start_time = datetime.now()
-                            res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
+                            res = await self._call_api_with_local_cache(images, prompt, model, False, self.img_mgr.proxy)
 
                             if isinstance(res, bytes):
                                 res = await self._prepare_send_image_bytes(res)
@@ -2812,7 +2878,7 @@ class FigurineProPlugin(Star):
         )
 
         start = datetime.now()
-        res = await self.api_mgr.call_api(
+        res = await self._call_api_with_local_cache(
             images, user_prompt, model, self.img_mgr.proxy,
             use_text_to_image_api=is_text_to_image
         )
@@ -2870,7 +2936,7 @@ class FigurineProPlugin(Star):
         model = self._get_text_to_image_model()
         self._log_prompt_preview("command:文生图", final_prompt)
         start = datetime.now()
-        res = await self.api_mgr.call_api(
+        res = await self._call_api_with_local_cache(
             images, final_prompt, model, False, self.img_mgr.proxy,
             use_text_to_image_api=True
         )
@@ -4068,8 +4134,9 @@ class FigurineProPlugin(Star):
             if not pdf_bytes:
                 return False, "打包 PDF 失败了，可能图片格式不支持。"
 
-            import uuid
             import os
+            import uuid
+
             from astrbot.core.message.components import File
 
             filename = (filename_hint or "").strip()
@@ -4171,7 +4238,7 @@ class FigurineProPlugin(Star):
             model = self.conf.get("model", "nano-banana")
             start_time = datetime.now()
 
-            res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
+            res = await self._call_api_with_local_cache(images, prompt, model, False, self.img_mgr.proxy)
 
             # 处理结果
             if isinstance(res, bytes):
@@ -4510,8 +4577,8 @@ class FigurineProPlugin(Star):
                                     if ref_images:
                                         images = ref_images + images
                                 model = self.conf.get("model", "nano-banana")
-                                res = await self.api_mgr.call_api(images, final_prompt, model, False,
-                                                                  self.img_mgr.proxy)
+                                res = await self._call_api_with_local_cache(images, final_prompt, model, False,
+                                                                            self.img_mgr.proxy)
                                 if isinstance(res, bytes):
                                     res = await self._prepare_send_image_bytes(res)
                                     pdf_result_images.append(res)
@@ -4603,6 +4670,7 @@ class FigurineProPlugin(Star):
                             # astrbot 的文件组件支持直接发字节(通过File类)，但在标准组件中未必完善，
                             # 这里我们将其写入到临时目录或者缓存里再发送
                             import os
+
                             from astrbot.core.message.components import File
                             tmp_path = os.path.join(self.data_mgr.data_dir, filename)
                             with open(tmp_path, "wb") as f:
@@ -4801,8 +4869,8 @@ class FigurineProPlugin(Star):
                                     if ref_images:
                                         images = ref_images + images
                                 model = self.conf.get("model", "nano-banana")
-                                res = await self.api_mgr.call_api(images, final_prompt, model, False,
-                                                                  self.img_mgr.proxy)
+                                res = await self._call_api_with_local_cache(images, final_prompt, model, False,
+                                                                            self.img_mgr.proxy)
                                 if isinstance(res, bytes):
                                     res = await self._prepare_send_image_bytes(res)
                                     async with results_lock:
@@ -4898,8 +4966,9 @@ class FigurineProPlugin(Star):
                         ordered_images = [pdf_result_images_dict[k] for k in sorted(pdf_result_images_dict.keys())]
                         pdf_bytes_result = self.img_mgr.images_to_pdf(ordered_images)
                         if pdf_bytes_result:
-                            import uuid
                             import os
+                            import uuid
+
                             from astrbot.core.message.components import File
                             filename = self._build_pdf_filename_hint(
                                 prompt=extra_rules or prompt,
@@ -5300,7 +5369,7 @@ class FigurineProPlugin(Star):
         # 调用 API
         model = self.conf.get("model", "nano-banana")
         start = datetime.now()
-        res = await self.api_mgr.call_api(final_images, full_prompt, model, False, self.img_mgr.proxy)
+        res = await self._call_api_with_local_cache(final_images, full_prompt, model, False, self.img_mgr.proxy)
 
         if isinstance(res, bytes):
             res = await self._prepare_send_image_bytes(res)

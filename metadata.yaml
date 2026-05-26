@@ -1,4 +1,4 @@
-name: astrbot_plugin_shoubanhua
+name: astrbot_plugin_aidraw
 desc: 支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断
 help: |
   🎨 手办化插件
@@ -13,5 +13,5 @@ help: |
   - #清除上下文 - 清除当前会话上下文
   - #测试智能判断 <文本> - 测试智能判断功能
 version: v2.8.8
-author: shskjw
-repo: https://github.com/shskjw/astrbot_plugin_shoubanhua
+author: Himzandar
+repo: https://github.com/Himzandar/astrbot_plugin_aidraw

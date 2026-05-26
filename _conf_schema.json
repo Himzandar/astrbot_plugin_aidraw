@@ -124,6 +124,20 @@
         "hint": "开启后，在成功或失败提示中展示实际使用的模型名称。",
         "default": false
     },
+    "enable_local_generation_cache": {
+        "description": "【缓存】启用本地生成记录缓存",
+        "type": "bool",
+        "hint": "开启后，会按提示词在插件数据目录本地保存生成记录，包含返回图片或错误信息，以及基础请求上下文。",
+        "default": true
+    },
+    "local_generation_prompt_history_limit": {
+        "description": "【缓存】每个提示词保留记录数",
+        "type": "int",
+        "hint": "同一提示词 hash 在本地按时间保留的最新记录条数。完整流水仍会追加到 generation_records.jsonl。",
+        "default": 10,
+        "min": 1,
+        "max": 200
+    },
     "debug_mode": {
         "description": "【调试】调试模式",
         "type": "bool",
