@@ -3397,6 +3397,10 @@ class FigurineProPlugin(Star):
             return self._finalize_llm_tool_result(
                 "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
+        active_task = await self._get_active_session_task(event.unified_msg_origin)
+        if active_task:
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {self._build_active_task_reply(active_task)}")
+
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
         in_cooldown, remaining = self._check_image_cooldown(uid)
@@ -5223,60 +5227,72 @@ class FigurineProPlugin(Star):
         # 9. 计算是否隐藏输出文本（白名单用户和普通用户使用同一开关）
         hide_llm_result_text = True
 
-        # 10. 等待拍照任务完成并确认图片已发送，再把成功结果交给二次 LLM 收尾。
+        # 10. 任务改为后台执行，避免 LLM 工具在图片真正发出前一直阻塞。
         await self._register_pending_generation(event.unified_msg_origin, count)
+        await self._begin_session_task(event.unified_msg_origin, "人设拍照任务", count)
+
+        async def run_persona_photo_task():
+            try:
+                if count == 1:
+                    success, error_msg = await self._run_background_task(
+                        event=event,
+                        images=final_images,
+                        prompt=full_prompt,
+                        preset_name=f"人设-{scene_name}",
+                        deduction=deduction,
+                        uid=uid,
+                        gid=gid,
+                        cost=1,
+                        extra_rules=extra_request,
+                        hide_text=hide_llm_result_text,
+                        suppress_user_error=True
+                    )
+                    if not success:
+                        logger.warning(f"Persona photo background task failed: {error_msg}")
+                    return
+
+                # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
+                # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
+                # _run_batch_image_to_image 中有逻辑：如果不是“自定义”，就去取预设图片叠加。
+                # "人设-xxx" 是不会在预设里查到的，所以不会产生重复！这是完美的。
+                batch_result = await self._run_batch_image_to_image(
+                    event=event,
+                    images=final_images,
+                    prompt=full_prompt,
+                    preset_name=f"人设-{scene_name}",
+                    deduction=deduction,
+                    uid=uid,
+                    gid=gid,
+                    count=count,
+                    extra_rules=extra_request,
+                    hide_text=hide_llm_result_text,
+                    suppress_user_error=True
+                )
+                total_success = int(batch_result.get("success", 0))
+                if total_success <= 0:
+                    branch_errors = batch_result.get("errors", [])
+                    logger.warning(
+                        "Persona photo batch task failed: %s",
+                        branch_errors[0] if branch_errors else "这次没弄好，请稍后再试。"
+                    )
+            except Exception as exc:
+                logger.error(f"Persona photo task crashed: {exc}", exc_info=True)
+            finally:
+                await self._finish_session_task(event.unified_msg_origin)
+
+        asyncio.create_task(run_persona_photo_task())
+
+        limit_reply = self._build_count_limit_reply(count, "persona") if count_limited else ""
         if count == 1:
-            success, error_msg = await self._run_background_task(
-                event=event,
-                images=final_images,
-                prompt=full_prompt,
-                preset_name=f"人设-{scene_name}",
-                deduction=deduction,
-                uid=uid,
-                gid=gid,
-                cost=1,
-                extra_rules=extra_request,
-                hide_text=hide_llm_result_text,
-                suppress_user_error=True
-            )
-            if not success:
-                return self._build_llm_tool_failure(error_msg)
-            if count_limited:
-                return self._finalize_llm_tool_success(
-                    f"[TOOL_SUCCESS] 照片已经发给用户。{self._build_count_limit_reply(count, 'persona')} 请自然收尾一句。")
-            return self._finalize_llm_tool_success(
-                "[TOOL_SUCCESS] 照片已经发给用户。请用你自己的语气自然收尾一句，比如“给你啦，才不是特意拍给你的呢。”不要提系统、工具或生成。")
+            prompt_text = "[TOOL_SUCCESS] 人设拍照任务已启动。照片会稍后发给用户，请自然告诉用户先稍等一下，不要提系统、工具或生成。"
         else:
-            # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
-            # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
-            # _run_batch_image_to_image 中有逻辑：如果不是“自定义”，就去取预设图片叠加。
-            # "人设-xxx" 是不会在预设里查到的，所以不会产生重复！这是完美的。
-            batch_result = await self._run_batch_image_to_image(
-                event=event,
-                images=final_images,
-                prompt=full_prompt,
-                preset_name=f"人设-{scene_name}",
-                deduction=deduction,
-                uid=uid,
-                gid=gid,
-                count=count,
-                extra_rules=extra_request,
-                hide_text=hide_llm_result_text,
-                suppress_user_error=True
+            prompt_text = (
+                f"[TOOL_SUCCESS] 人设拍照任务已启动，共 {count} 张。"
+                "照片会陆续发给用户，请自然告诉用户先稍等一下，不要提系统、工具或生成。"
             )
-            total_success = int(batch_result.get("success", 0))
-            total_fail = int(batch_result.get("fail", 0))
-            branch_errors = batch_result.get("errors", [])
-            if total_success <= 0:
-                return self._build_llm_tool_failure(branch_errors[0] if branch_errors else "这次没弄好，请稍后再试。")
-            if count_limited:
-                return self._finalize_llm_tool_success(
-                    f"[TOOL_SUCCESS] 照片已经发给用户，成功 {total_success} 张。{self._build_count_limit_reply(count, 'persona')} 请自然收尾一句。")
-            if total_fail > 0:
-                return self._finalize_llm_tool_success(
-                    f"[TOOL_SUCCESS] 照片已经发给用户，成功 {total_success} 张，有 {total_fail} 张没弄好。请自然地随口带过。")
-            return self._finalize_llm_tool_success(
-                f"[TOOL_SUCCESS] {total_success} 张照片已经发给用户。请用你自己的语气自然收尾一句，比如“给你啦，才不是特意拍给你的呢。”不要提系统、工具或生成。")
+        if limit_reply:
+            prompt_text = f"{prompt_text} {limit_reply}"
+        return self._finalize_llm_tool_success(prompt_text)
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
